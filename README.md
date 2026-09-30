@@ -83,6 +83,13 @@ The Jepsen test that uses it is `swiftpaxos/` in [tuplesky/jepsen](https://githu
     go build -o bin/ . ./cmd/swiftpaxos-jepsen
     bin/swiftpaxos-jepsen -server n1:7070 -master 172.18.0.1 -replicas 5 -log client.log
 
+`-server` takes `HOST:PORT` or `HOST`; the client matches replicas by host alone, and takes the closest by ping when none matches.
+
+Two upstream problems show under Jepsen partitions, and this client does not fix them:
+
+- The master's leader check (`master/master.go`, `Replica.Ping` in a sequential loop) is a `net/rpc` call with no deadline, so a leader cut off by a dropping partition hangs it and is never replaced.
+- A replica flushes its peers' writers under the global `r.M` from one goroutine, with no write deadline (`replica/replica.go`, `replica/sender.go`, `swift/batcher.go`), so once the send buffer to a cut peer fills, the whole replica stalls.
+
 Flint
 -----
 

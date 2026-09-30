@@ -25,6 +25,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"time"
@@ -47,10 +48,10 @@ type answer struct {
 }
 
 // session is what an operation needs from a connected client: send a
-// command, and the replies as they are delivered, each tagged with the
-// sequence number of its command.
+// command, getting its sequence number, and the replies as they are
+// delivered, each tagged with the sequence number of its command.
 type session interface {
-	send(req request) error
+	send(req request) (int, error)
 	replies() <-chan reply
 }
 
@@ -77,10 +78,9 @@ func decode(b []byte) (*int64, error) {
 	return &v, nil
 }
 
-// perform sends the seq-th command of the session and waits for its reply.
-// Replies to earlier commands are skipped. It says whether the session is
-// still usable.
-func perform(s session, seq int, req request, timeout time.Duration) (answer, bool) {
+// perform sends a command and waits for its reply. Replies to other
+// commands are skipped. It says whether the session is still usable.
+func perform(s session, req request, timeout time.Duration) (answer, bool) {
 	switch req.F {
 	case "read":
 	case "write":
@@ -96,28 +96,50 @@ func perform(s session, seq int, req request, timeout time.Duration) (answer, bo
 	}
 	// A send can block on a replica that does not read (paused), so it
 	// runs on its own and counts against the timeout.
-	sent := make(chan error, 1)
-	go func() { sent <- s.send(req) }()
+	type result struct {
+		seq int
+		err error
+	}
+	sent := make(chan result, 1)
+	go func() {
+		seq, err := s.send(req)
+		sent <- result{seq, err}
+	}()
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
+	// The command's reply can come before its sequence number does: the
+	// replies that come first wait for it here.
+	seq, known := 0, false
+	var early []reply
+	done := func(r reply) (answer, bool) {
+		if req.F == "write" {
+			return answer{Type: "ok", Value: req.Value}, true
+		}
+		v, err := decode(r.value)
+		if err != nil {
+			return answer{Type: "fail", Error: err.Error()}, false
+		}
+		return answer{Type: "ok", Value: v}, true
+	}
 	for {
 		select {
-		case err := <-sent:
-			if err != nil {
-				return answer{Type: unknown, Error: "send: " + err.Error()}, false
+		case res := <-sent:
+			if res.err != nil {
+				return answer{Type: unknown, Error: "send: " + res.err.Error()}, false
 			}
+			seq, known = res.seq, true
+			for _, r := range early {
+				if r.seq == seq {
+					return done(r)
+				}
+			}
+			early = nil
 		case r := <-s.replies():
-			if r.seq != seq {
-				continue
+			if !known {
+				early = append(early, r)
+			} else if r.seq == seq {
+				return done(r)
 			}
-			if req.F == "write" {
-				return answer{Type: "ok", Value: req.Value}, true
-			}
-			v, err := decode(r.value)
-			if err != nil {
-				return answer{Type: "fail", Error: err.Error()}, false
-			}
-			return answer{Type: "ok", Value: v}, true
 		case <-deadline.C:
 			return answer{Type: unknown, Error: "timeout"}, false
 		}
@@ -129,12 +151,12 @@ func perform(s session, seq int, req request, timeout time.Duration) (answer, bo
 func serve(s session, in io.Reader, out io.Writer, timeout time.Duration) error {
 	scanner := bufio.NewScanner(in)
 	enc := json.NewEncoder(out)
-	for seq := 0; scanner.Scan(); seq++ {
+	for scanner.Scan() {
 		var req request
 		if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
 			return fmt.Errorf("bad request line: %w", err)
 		}
-		a, ok := perform(s, seq, req, timeout)
+		a, ok := perform(s, req, timeout)
 		if err := enc.Encode(a); err != nil {
 			return err
 		}
@@ -151,13 +173,11 @@ type upstream struct {
 	rs chan reply
 }
 
-func (u *upstream) send(req request) error {
+func (u *upstream) send(req request) (int, error) {
 	if req.F == "write" {
-		u.b.SendWrite(req.Key, encode(*req.Value))
-	} else {
-		u.b.SendRead(req.Key)
+		return int(u.b.SendWrite(req.Key, encode(*req.Value))), nil
 	}
-	return nil
+	return int(u.b.SendRead(req.Key)), nil
 }
 
 func (u *upstream) replies() <-chan reply { return u.rs }
@@ -189,16 +209,21 @@ func findOnPath(name string) (string, error) {
 }
 
 func connect(server, master string, port, replicas int, logPath string) (*upstream, error) {
+	// The upstream client knows replicas by host alone, and takes the
+	// closest one by ping when -server names none of them.
+	host, _, err := net.SplitHostPort(server)
+	if err != nil {
+		host = server
+	}
 	logger := dlog.New(logPath, true)
-	c := client.NewClientLog(server, master, port, true, false, true, logger)
+	c := client.NewClientLog(host, master, port, true, false, true, logger)
 	// The reply buffer outlasts any session: one reply a command.
 	b := client.NewBufferClient(c, 1<<16, 8, 0, 0, 0)
 	if err := b.Connect(); err != nil {
 		return nil, err
 	}
-	if swift.NewClient(b, replicas) == nil {
-		return nil, errors.New("no SwiftPaxos client")
-	}
+	// It sets the SwiftPaxos reply rules on b.
+	swift.NewClient(b, replicas)
 	u := &upstream{b: b, rs: make(chan reply, 16)}
 	go func() {
 		for r := range b.Reply {
