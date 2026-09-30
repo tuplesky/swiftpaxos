@@ -72,6 +72,17 @@ Client:
 
 See [quorum.conf][quorum] and [latency.conf][latency] for an example of quorum and latency configuration files.
 
+Jepsen client
+-------------
+
+`cmd/swiftpaxos-jepsen` is one client session for a [Jepsen](https://jepsen.io) test, driven over JSON lines on stdin and stdout: one request a line in (`{"f":"write","key":3,"value":7}`, `{"f":"read","key":3}`), one answer a line out (`{"type":"ok","value":7}`).
+It connects the SwiftPaxos client through the master, with a chosen replica as its closest.
+An operation that times out is `info` for a write (it may still take effect) and `fail` for a read, and the session ends after it: the client keeps one reply value per session, so a late reply could be taken for the next command's.
+The Jepsen test that uses it is `swiftpaxos/` in [tuplesky/jepsen](https://github.com/tuplesky/jepsen).
+
+    go build -o bin/ . ./cmd/swiftpaxos-jepsen
+    bin/swiftpaxos-jepsen -server n1:7070 -master 172.18.0.1 -replicas 5 -log client.log
+
 Flint
 -----
 
